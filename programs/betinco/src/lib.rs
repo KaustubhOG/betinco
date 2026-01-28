@@ -1,4 +1,12 @@
+// Fix src/lib.rs - change instruction:: to instructions::
+
 use anchor_lang::prelude::*;
+
+pub mod error;
+pub mod state;
+pub mod instructions;
+
+use instructions::*;
 
 declare_id!("2ZZGJxn8H7uoyJ1WmWbUkc5wqEEBpXuDM3TvXC8rCH7Q");
 
@@ -11,7 +19,7 @@ pub mod betinco {
         market_id: u32,
         settlement_deadline: i64,
     ) -> Result<()> {
-        instructions::initialize_market::handle(ctx, market_id, settlement_deadline)
+        initialize_market::handle(ctx, market_id, settlement_deadline)
     }
 
     pub fn place_bet_private(
@@ -19,9 +27,9 @@ pub mod betinco {
         market_id: u32,
         amount: u64,
         side: state::WinningOutcome,
-        encrypted_bet_data: Vec<u8>, // Encrypted data from Inco client
+        encrypted_bet_data: Vec<u8>,
     ) -> Result<()> {
-        instructions::place_bet_private::handle(ctx, market_id, amount, side, encrypted_bet_data)
+        place_bet_private::handle(ctx, market_id, amount, side, encrypted_bet_data)
     }
 
     pub fn set_winning_side(
@@ -29,14 +37,14 @@ pub mod betinco {
         market_id: u32,
         winner: state::WinningOutcome,
     ) -> Result<()> {
-        instructions::set_winning_side::handle(ctx, market_id, winner)
+        set_winning_side::handle(ctx, market_id, winner)
     }
 
     pub fn claim_private(
         ctx: Context<ClaimPrivate>,
         market_id: u32,
-        inco_proof: Vec<u8>, // Proof from Inco that user is eligible
+        inco_proof: Vec<u8>,
     ) -> Result<()> {
-        instructions::claim_private::handle(ctx, market_id, inco_proof)
+        claim_private::handle(ctx, market_id, inco_proof)
     }
 }
