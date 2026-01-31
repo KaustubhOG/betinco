@@ -1,3 +1,4 @@
+
 // "use client";
 
 // import { useEffect, useState } from "react";
@@ -78,13 +79,12 @@
 //         }}
 //       >
 //         {markets.map((m) => (
-//           <MarketCard key={m.id} id={m.id} question={m.question} />
+//           <MarketCard key={m.id} id={m.id} question={m.question} deadline={m.deadline} />
 //         ))}
 //       </div>
 //     </>
 //   );
 // }
-
 "use client";
 
 import { useEffect, useState } from "react";
@@ -104,9 +104,7 @@ export default function HomePage() {
     setLoading(true);
     setError(null);
     try {
-      console.log("Fetching markets...");
       const data = await fetchAllMarkets();
-      console.log("Fetched markets:", data);
       setMarkets(data);
     } catch (err: any) {
       console.error("Failed to load markets:", err);
@@ -118,70 +116,208 @@ export default function HomePage() {
 
   if (loading) {
     return (
-      <div className="flex h-[50vh] flex-col items-center justify-center space-y-4">
-        <div className="h-10 w-10 animate-spin rounded-full border-4 border-slate-700 border-t-blue-500"></div>
-        <p className="text-slate-400">Loading markets...</p>
+      <div style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minHeight: '60vh',
+        gap: '16px',
+      }}>
+        <div style={{
+          width: '48px',
+          height: '48px',
+          border: '4px solid var(--border-primary)',
+          borderTop: '4px solid var(--brand-primary)',
+          borderRadius: '50%',
+          animation: 'spin 1s linear infinite',
+        }} />
+        <p style={{ color: 'var(--text-secondary)', fontSize: '14px' }}>
+          Loading markets...
+        </p>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="flex h-[50vh] flex-col items-center justify-center space-y-4 text-center">
-        <div className="rounded-full bg-red-500/10 p-4 text-red-500">
-          ⚠️
+      <div style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minHeight: '60vh',
+        gap: '20px',
+      }}>
+        <div style={{
+          padding: '24px',
+          borderRadius: '12px',
+          background: 'rgba(239, 68, 68, 0.1)',
+          border: '1px solid rgba(239, 68, 68, 0.2)',
+          maxWidth: '500px',
+          textAlign: 'center',
+        }}>
+          <h2 style={{ color: 'var(--error)', marginBottom: '12px', fontSize: '20px' }}>
+            Error loading markets
+          </h2>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '20px' }}>
+            {error}
+          </p>
+          <button
+            onClick={loadMarkets}
+            style={{
+              padding: '10px 24px',
+              background: 'var(--brand-primary)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '8px',
+              fontSize: '14px',
+              fontWeight: '600',
+              cursor: 'pointer',
+              transition: 'all 0.2s ease',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'var(--brand-hover)';
+              e.currentTarget.style.transform = 'translateY(-2px)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'var(--brand-primary)';
+              e.currentTarget.style.transform = 'translateY(0)';
+            }}
+          >
+            Retry
+          </button>
         </div>
-        <h2 className="text-xl font-semibold text-white">Error loading markets</h2>
-        <p className="max-w-md text-slate-400">{error}</p>
-        <button 
-          onClick={loadMarkets} 
-          className="mt-4 rounded-lg bg-blue-600 px-6 py-2 font-semibold text-white transition-colors hover:bg-blue-500"
-        >
-          Try Again
-        </button>
+      </div>
+    );
+  }
+
+  if (markets.length === 0) {
+    return (
+      <div style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minHeight: '60vh',
+        gap: '20px',
+      }}>
+        <div style={{
+          padding: '48px',
+          borderRadius: '16px',
+          background: 'var(--bg-secondary)',
+          border: '1px solid var(--border-primary)',
+          maxWidth: '500px',
+          textAlign: 'center',
+        }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>📊</div>
+          <h2 style={{ color: 'var(--text-primary)', marginBottom: '12px', fontSize: '24px' }}>
+            No markets found
+          </h2>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '24px' }}>
+            Create your first prediction market in the admin panel to get started
+          </p>
+          <button
+            onClick={loadMarkets}
+            style={{
+              padding: '10px 24px',
+              background: 'var(--brand-primary)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '8px',
+              fontSize: '14px',
+              fontWeight: '600',
+              cursor: 'pointer',
+              transition: 'all 0.2s ease',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'var(--brand-hover)';
+              e.currentTarget.style.transform = 'translateY(-2px)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'var(--brand-primary)';
+              e.currentTarget.style.transform = 'translateY(0)';
+            }}
+          >
+            Refresh
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="space-y-6">
-      {/* Page Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-            <span className="text-2xl font-bold text-white">All Markets</span>
-            <span className="rounded-full bg-[#2C3240] px-2 py-0.5 text-xs font-medium text-slate-400">
-                {markets.length}
-            </span>
+    <div style={{ animation: 'slideUp 0.4s ease-out' }}>
+      {/* Header */}
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: '32px',
+      }}>
+        <div>
+          <h1 style={{
+            fontSize: '32px',
+            fontWeight: '700',
+            marginBottom: '8px',
+            background: 'linear-gradient(135deg, var(--text-primary) 0%, var(--text-secondary) 100%)',
+            WebkitBackgroundClip: 'text',
+            WebkitTextFillColor: 'transparent',
+          }}>
+            Prediction Markets
+          </h1>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '14px' }}>
+            {markets.length} active {markets.length === 1 ? 'market' : 'markets'}
+          </p>
         </div>
-
         <button
           onClick={loadMarkets}
-          className="group flex items-center gap-2 rounded-lg border border-[#2C3240] bg-[#1A1D27] px-3 py-1.5 text-sm font-medium text-slate-300 hover:border-slate-600 hover:text-white transition-all"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            padding: '10px 20px',
+            background: 'var(--bg-tertiary)',
+            color: 'var(--text-primary)',
+            border: '1px solid var(--border-primary)',
+            borderRadius: '8px',
+            fontSize: '14px',
+            fontWeight: '600',
+            cursor: 'pointer',
+            transition: 'all 0.2s ease',
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = 'var(--bg-hover)';
+            e.currentTarget.style.borderColor = 'var(--brand-primary)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = 'var(--bg-tertiary)';
+            e.currentTarget.style.borderColor = 'var(--border-primary)';
+          }}
         >
-          <svg className="h-4 w-4 transition-transform group-hover:rotate-180" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
           </svg>
           Refresh
         </button>
       </div>
 
       {/* Markets Grid */}
-      {markets.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-[#2C3240] bg-[#1A1D27]/50 py-20 text-center">
-          <p className="text-slate-500">No active markets found.</p>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {markets.map((market) => (
-            <MarketCard
-                key={market.id}
-                id={market.id}
-                question={market.question}
-                deadline={market.deadline}
-            />
-            ))}
-        </div>
-      )}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))',
+        gap: '20px',
+      }}>
+        {markets.map((m) => (
+          <MarketCard
+            key={m.id}
+            id={m.id}
+            question={m.question}
+            deadline={m.deadline}
+          />
+        ))}
+      </div>
     </div>
   );
 }

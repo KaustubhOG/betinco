@@ -6,11 +6,17 @@ import { Connection } from "@solana/web3.js";
 
 const HELIUS_RPC = "https://devnet.helius-rpc.com/?api-key=921ba1f0-fa17-4803-8417-e8c04743d961";
 
+// Toggle simulation on/off. When true, code will simulate a successful permission grant
+// and skip Inco SDK calls that are currently unavailable.
+const SIMULATE_PERMISSION = true;
+
 export default function GrantPermission({ marketId }: { marketId: string }) {
   const wallet = useWallet();
   const anchorWallet = useAnchorWallet();
   const [loading, setLoading] = useState(false);
   const [granted, setGranted] = useState(false);
+
+  const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
   const grantPermission = async () => {
     if (!anchorWallet || !wallet.publicKey) {
@@ -21,9 +27,25 @@ export default function GrantPermission({ marketId }: { marketId: string }) {
     setLoading(true);
 
     try {
+      if (SIMULATE_PERMISSION) {
+        // Simulation path: pretend permission grant succeeded
+        await sleep(800); // small delay to emulate async work
+
+        console.log("✅ Permission grant simulated for market", marketId);
+        alert(
+          `Permission grant simulated successfully.\n\n` +
+          `Note: Real Inco SDK permission granting is currently not functioning in this environment. ` +
+          `This action was simulated. The Inco SDK integration will be fixed in v2.`
+        );
+        setGranted(true);
+        setLoading(false);
+        return;
+      }
+
+      // === Real flow (kept here for reference; not executed when SIMULATE_PERMISSION = true) ===
       const connection = new Connection(HELIUS_RPC, "confirmed");
       
-      console.log("🔑 Granting decrypt permission for market", marketId);
+      console.log("🔒 Granting decrypt permission for market", marketId);
       
       // Import and use the permission granting function
       const { grantIncoDecryptPermission } = await import("../lib/grantIncoPermission");
@@ -107,7 +129,7 @@ export default function GrantPermission({ marketId }: { marketId: string }) {
             fontWeight: 600
           }}
         >
-          {loading ? "Granting Permission..." : "Grant Decrypt Permission"}
+          {loading ? "Granting Permission..." : (SIMULATE_PERMISSION ? "Grant Permission (Simulate)" : "Grant Decrypt Permission")}
         </button>
       )}
 
@@ -118,6 +140,12 @@ export default function GrantPermission({ marketId }: { marketId: string }) {
       }}>
         💡 This allows you to decrypt your YES/NO choice when claiming rewards
       </div>
+
+      {SIMULATE_PERMISSION && (
+        <div style={{ marginTop: "12px", fontSize: "12px", color: "#78350f" }}>
+          Note: Inco SDK is currently unavailable in this environment. This permission grant is simulated. Real Inco SDK integration will be implemented in v2.
+        </div>
+      )}
     </div>
   );
 }
