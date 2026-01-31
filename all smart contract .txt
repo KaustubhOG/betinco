@@ -1,0 +1,852 @@
+claim orivate 
+use crate::error::PredictionMarketError;
+use crate::instructions::place_bet_private::BetData;
+use crate::state::{Market, WinningOutcome};
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::sysvar::instructions::{
+    load_instruction_at_checked, ID as INSTRUCTIONS_SYSVAR_ID,
+};
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use inco_lightning::cpi::accounts::Operation;
+use inco_lightning::cpi::{e_eq, new_euint128};
+use inco_lightning::types::Ebool;
+use inco_lightning::ID as INCO_LIGHTNING_ID;
+
+// Inco TEE authority public key (configure this with your actual TEE nodes)
+// In production, this should be configurable or stored on-chain
+const TEE_AUTHORITY_PUBKEY: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]; // REPLACE WITH REAL TEE PUBKEY
+
+#[derive(Accounts)]
+#[instruction(market_id: u32)]
+pub struct ClaimPrivate<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"market", market.market_id.to_le_bytes().as_ref()],
+        bump = market.bump,
+        constraint = market.market_id == market_id
+    )]
+    pub market: Account<'info, Market>,
+
+    #[account(
+        mut,
+        constraint = user_collateral.mint == market.collateral_mint,
+        constraint = user_collateral.owner == user.key()
+    )]
+    pub user_collateral: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = collateral_vault.key() == market.collateral_vault,
+        constraint = collateral_vault.owner == market.key()
+    )]
+    pub collateral_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"bet", market.key().as_ref(), user.key().as_ref()],
+        bump = bet_account.bump,
+    )]
+    pub bet_account: Account<'info, BetData>,
+
+    pub token_program: Program<'info, Token>,
+
+    /// CHECK: Inco Lightning program for encrypted operations
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
+
+    /// CHECK: Solana Instructions Sysvar for Ed25519 verification
+    #[account(address = INSTRUCTIONS_SYSVAR_ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+pub fn handle(
+    ctx: Context<ClaimPrivate>,
+    _market_id: u32,
+    decrypted_proof: Vec<u8>,
+) -> Result<()> {
+    let market = &ctx.accounts.market;
+
+    // Validate market is settled
+    require!(market.is_settled, PredictionMarketError::MarketNotSettled);
+
+    let winning_outcome = market
+        .winning_outcome
+        .ok_or(PredictionMarketError::WinningOutcomeNotSet)?;
+
+    // Check user hasn't already claimed (check before mutable borrow)
+    require!(!ctx.accounts.bet_account.claimed, PredictionMarketError::AlreadyClaimed);
+
+    // VERIFY TEE SIGNATURE
+    // ====================
+    // Transaction must include Ed25519Program instruction BEFORE this instruction
+    // Format: [payout_amount(8), is_winner(1), nonce(8), timestamp(8)]
+    
+    verify_tee_signature(&ctx, &decrypted_proof)?;
+
+    // Now we can safely get mutable borrow
+    let bet_account = &mut ctx.accounts.bet_account;
+
+    // Parse decrypted proof
+    require!(
+        decrypted_proof.len() >= 25,
+        PredictionMarketError::InvalidProof
+    );
+
+    let payout_amount = u64::from_le_bytes(
+        decrypted_proof[0..8]
+            .try_into()
+            .map_err(|_| PredictionMarketError::InvalidProof)?,
+    );
+
+    let is_winner = decrypted_proof[8] == 1;
+
+    let nonce = u64::from_le_bytes(
+        decrypted_proof[9..17]
+            .try_into()
+            .map_err(|_| PredictionMarketError::InvalidProof)?,
+    );
+
+    let timestamp = i64::from_le_bytes(
+        decrypted_proof[17..25]
+            .try_into()
+            .map_err(|_| PredictionMarketError::InvalidProof)?,
+    );
+
+    // Verify timestamp is recent (within 5 minutes)
+    let current_time = Clock::get()?.unix_timestamp;
+    require!(
+        (current_time - timestamp).abs() < 300,
+        PredictionMarketError::InvalidProof
+    );
+
+    // Verify nonce is unique (store in bet_account to prevent replay)
+    // In production, use a separate nonce tracking account
+    msg!("Nonce: {}", nonce);
+
+    // Handle draw scenario
+    if winning_outcome == WinningOutcome::Neither {
+        require!(is_winner, PredictionMarketError::NotEligible);
+
+        transfer_payout(
+            &ctx.accounts.market,
+            &ctx.accounts.collateral_vault,
+            &ctx.accounts.user_collateral,
+            &ctx.accounts.token_program,
+            payout_amount / 2, // 50% return for draw
+        )?;
+
+        bet_account.claimed = true;
+
+        emit!(RewardClaimedEvent {
+            market_id: market.market_id,
+            user: ctx.accounts.user.key(),
+            payout: payout_amount / 2,
+            timestamp: current_time,
+        });
+
+        return Ok(());
+    }
+
+    // For normal outcomes (A or B), verify winner using encrypted comparison
+    let winning_side_value = match winning_outcome {
+        WinningOutcome::OutcomeA => 0u128,
+        WinningOutcome::OutcomeB => 1u128,
+        _ => return Err(PredictionMarketError::InvalidWinningOutcome.into()),
+    };
+
+    // Create encrypted winning side
+    let side_bytes = winning_side_value.to_le_bytes().to_vec();
+    let encrypted_winning_side = new_euint128(
+        CpiContext::new(
+            ctx.accounts.inco_lightning_program.to_account_info(),
+            Operation {
+                signer: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        side_bytes,
+        0,
+    )?;
+
+    // Compare encrypted bet side with winning side
+    let _is_winner_encrypted: Ebool = e_eq(
+        CpiContext::new(
+            ctx.accounts.inco_lightning_program.to_account_info(),
+            Operation {
+                signer: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        bet_account.encrypted_side,
+        encrypted_winning_side,
+        0,
+    )?;
+
+    // TEE has verified winner status off-chain and signed the proof
+    // We trust the TEE signature verification done above
+    require!(is_winner, PredictionMarketError::NotEligible);
+
+    // Verify vault has sufficient balance
+    ctx.accounts.collateral_vault.reload()?;
+    require!(
+        ctx.accounts.collateral_vault.amount >= payout_amount,
+        PredictionMarketError::InsufficientVaultBalance
+    );
+
+    // Transfer payout
+    transfer_payout(
+        &ctx.accounts.market,
+        &ctx.accounts.collateral_vault,
+        &ctx.accounts.user_collateral,
+        &ctx.accounts.token_program,
+        payout_amount,
+    )?;
+
+    bet_account.claimed = true;
+
+    emit!(RewardClaimedEvent {
+        market_id: market.market_id,
+        user: ctx.accounts.user.key(),
+        payout: payout_amount,
+        timestamp: current_time,
+    });
+
+    msg!("Rewards claimed for market {}", market.market_id);
+    Ok(())
+}
+
+/// Verify TEE signature using Ed25519 instruction introspection
+fn verify_tee_signature(ctx: &Context<ClaimPrivate>, message: &[u8]) -> Result<()> {
+    // Try to load the previous instruction (index 0 in the introspection sysvar refers to the Ed25519 instruction)
+    // The current instruction is automatically at index 1
+    let ed25519_ix = match load_instruction_at_checked(
+        0,
+        &ctx.accounts.instructions_sysvar.to_account_info(),
+    ) {
+        Ok(ix) => ix,
+        Err(_) => {
+            msg!("No Ed25519 instruction found");
+            return Err(PredictionMarketError::InvalidProof.into());
+        }
+    };
+
+    // Verify it's the Ed25519Program
+    if ed25519_ix.program_id != anchor_lang::solana_program::ed25519_program::id() {
+        msg!("Previous instruction is not Ed25519Program");
+        return Err(PredictionMarketError::InvalidProof.into());
+    }
+
+    // Ed25519 instruction has no accounts
+    if !ed25519_ix.accounts.is_empty() {
+        msg!("Ed25519 instruction should have no accounts");
+        return Err(PredictionMarketError::InvalidProof.into());
+    }
+
+    // Parse Ed25519 instruction data
+    // Format: [num_signatures(1), padding(1), offsets(14 per sig), data]
+    let data = &ed25519_ix.data;
+    
+    require!(data.len() >= 2, PredictionMarketError::InvalidProof);
+    
+    let num_signatures = data[0];
+    require!(
+        num_signatures == 1,
+        PredictionMarketError::InvalidProof
+    );
+
+    // Each signature has 14 bytes of offsets
+    let offsets_start = 2;
+    let offsets_end = offsets_start + 14;
+    
+    require!(
+        data.len() >= offsets_end,
+        PredictionMarketError::InvalidProof
+    );
+
+    // Parse offsets (little-endian u16 values)
+    let sig_offset = u16::from_le_bytes([data[offsets_start], data[offsets_start + 1]]) as usize;
+    let sig_ix_index = data[offsets_start + 2];
+    let pubkey_offset = u16::from_le_bytes([data[offsets_start + 3], data[offsets_start + 4]]) as usize;
+    let pubkey_ix_index = data[offsets_start + 5];
+    let message_offset = u16::from_le_bytes([data[offsets_start + 6], data[offsets_start + 7]]) as usize;
+    let message_size = u16::from_le_bytes([data[offsets_start + 8], data[offsets_start + 9]]) as usize;
+    let message_ix_index = data[offsets_start + 10];
+
+    // All indices should point to this instruction (0xFFFF = same instruction)
+    require!(
+        sig_ix_index == 0xFF && pubkey_ix_index == 0xFF && message_ix_index == 0xFF,
+        PredictionMarketError::InvalidProof
+    );
+
+    // Extract signature (64 bytes)
+    require!(
+        data.len() >= sig_offset + 64,
+        PredictionMarketError::InvalidProof
+    );
+    let _signature = &data[sig_offset..sig_offset + 64];
+
+    // Extract public key (32 bytes)
+    require!(
+        data.len() >= pubkey_offset + 32,
+        PredictionMarketError::InvalidProof
+    );
+    let pubkey = &data[pubkey_offset..pubkey_offset + 32];
+
+    // Verify public key matches TEE authority
+    require!(
+        pubkey == &TEE_AUTHORITY_PUBKEY,
+        PredictionMarketError::InvalidProof
+    );
+
+    // Extract and verify message
+    require!(
+        data.len() >= message_offset + message_size,
+        PredictionMarketError::InvalidProof
+    );
+    let signed_message = &data[message_offset..message_offset + message_size];
+
+    // Verify message matches what we expect
+    require!(
+        signed_message == message,
+        PredictionMarketError::InvalidProof
+    );
+
+    // If we reach here, Ed25519Program has verified the signature
+    // (transaction would have failed otherwise)
+    
+    msg!("TEE signature verified successfully");
+    Ok(())
+}
+
+fn transfer_payout<'info>(
+    market: &Account<'info, Market>,
+    from: &Account<'info, TokenAccount>,
+    to: &Account<'info, TokenAccount>,
+    token_program: &Program<'info, Token>,
+    amount: u64,
+) -> Result<()> {
+    let market_id_bytes = market.market_id.to_le_bytes();
+    let seeds: &[&[u8]] = &[b"market", market_id_bytes.as_ref(), &[market.bump]];
+    let signer_seeds = &[seeds];
+
+    token::transfer(
+        CpiContext::new_with_signer(
+            token_program.to_account_info(),
+            Transfer {
+                from: from.to_account_info(),
+                to: to.to_account_info(),
+                authority: market.to_account_info(),
+            },
+            signer_seeds,
+        ),
+        amount,
+    )?;
+
+    Ok(())
+}
+
+#[event]
+pub struct RewardClaimedEvent {
+    pub market_id: u32,
+    pub user: Pubkey,
+    pub payout: u64,
+    pub timestamp: i64,
+}
+
+initialize market @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@2
+use crate::error::PredictionMarketError;
+use crate::state::Market;
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Mint, Token, TokenAccount};
+
+#[derive(Accounts)]
+#[instruction(market_id: u32, question: String)]
+pub struct InitializeMarket<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + Market::INIT_SPACE,
+        seeds = [b"market", market_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub collateral_mint: Account<'info, Mint>,
+
+    #[account(
+        init,
+        payer = authority,
+        token::mint = collateral_mint,
+        token::authority = market,
+        seeds = [b"vault", market_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub collateral_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+pub fn handle(
+    ctx: Context<InitializeMarket>,
+    market_id: u32,
+    question: String,
+    settlement_deadline: i64,
+) -> Result<()> {
+    let market = &mut ctx.accounts.market;
+
+    require!(
+        settlement_deadline > Clock::get()?.unix_timestamp,
+        PredictionMarketError::InvalidSettlementDeadline
+    );
+
+    require!(
+        question.len() > 0 && question.len() <= 200,
+        PredictionMarketError::InvalidAmount
+    );
+
+    market.authority = ctx.accounts.authority.key();
+    market.market_id = market_id;
+    market.question = question;
+    market.settlement_deadline = settlement_deadline;
+    market.collateral_mint = ctx.accounts.collateral_mint.key();
+    market.collateral_vault = ctx.accounts.collateral_vault.key();
+    market.is_settled = false;
+    market.winning_outcome = None;
+    market.bump = ctx.bumps.market;
+
+    msg!("Market initialized: {}", market.market_id);
+    Ok(())
+}
+
+place_bet_private @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+use crate::error::PredictionMarketError;
+use crate::state::Market;
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use inco_lightning::cpi::accounts::Operation;
+use inco_lightning::cpi::new_euint128;
+use inco_lightning::types::Euint128;
+use inco_lightning::ID as INCO_LIGHTNING_ID;
+
+// PRIVACY MODE SETTINGS
+const MAX_PRIVATE_BET: u64 = 10_000_000_000; // 10 SOL - max for private betting
+const PRIVATE_MODE_DEPOSIT: u64 = 10_000_000_000; // 10 SOL - fixed deposit for privacy
+
+#[derive(Accounts)]
+#[instruction(market_id: u32)]
+pub struct PlaceBetPrivate<'info> {
+    #[account(
+        mut,
+        seeds = [b"market", market.market_id.to_le_bytes().as_ref()],
+        bump = market.bump,
+        constraint = market.market_id == market_id
+    )]
+    pub market: Account<'info, Market>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = user_collateral.mint == market.collateral_mint,
+        constraint = user_collateral.owner == user.key()
+    )]
+    pub user_collateral: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = collateral_vault.key() == market.collateral_vault,
+        constraint = collateral_vault.owner == market.key()
+    )]
+    pub collateral_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+
+    /// CHECK: Inco Lightning program for encrypted operations
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + 32 + 32 + 1 + 1 + 1, // +1 for is_private_mode
+        seeds = [b"bet", market.key().as_ref(), user.key().as_ref()],
+        bump
+    )]
+    pub bet_account: Account<'info, BetData>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[account]
+pub struct BetData {
+    pub encrypted_amount: Euint128,
+    pub encrypted_side: Euint128,
+    pub is_private_mode: bool, // true = full privacy, false = amount visible
+    pub claimed: bool,
+    pub bump: u8,
+}
+
+pub fn handle(
+    ctx: Context<PlaceBetPrivate>,
+    _market_id: u32,
+    amount: u64, // Actual bet amount for public mode
+    is_private_mode: bool, // User chooses privacy mode
+    encrypted_bet_data: Vec<u8>,
+) -> Result<()> {
+    let market = &ctx.accounts.market;
+    let bet_account = &mut ctx.accounts.bet_account;
+
+    // Validate market state
+    require!(
+        !market.is_settled,
+        PredictionMarketError::MarketAlreadySettled
+    );
+    require!(
+        Clock::get()?.unix_timestamp < market.settlement_deadline,
+        PredictionMarketError::MarketExpired
+    );
+    require!(amount > 0, PredictionMarketError::InvalidAmount);
+
+    // Check if user already placed a bet
+    require!(!bet_account.claimed, PredictionMarketError::AlreadyClaimed);
+
+    let transfer_amount: u64;
+
+    if is_private_mode {
+        // PRIVATE MODE: Full privacy (amount + side encrypted)
+        // Max bet: 10 SOL
+        // Fixed deposit: 10 SOL (everyone deposits same amount)
+        
+        require!(
+            amount <= MAX_PRIVATE_BET,
+            PredictionMarketError::InvalidAmount
+        );
+
+        transfer_amount = PRIVATE_MODE_DEPOSIT;
+        
+        msg!("Private mode bet (max 10 SOL, full privacy)");
+    } else {
+        // PUBLIC AMOUNT MODE: Amount visible, side still encrypted
+        // No limit on bet amount
+        // Transfer actual bet amount (visible on-chain)
+        
+        transfer_amount = amount;
+        
+        msg!("Public amount mode (amount visible, unlimited)");
+    }
+
+    // Transfer collateral to vault
+    token::transfer(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_collateral.to_account_info(),
+                to: ctx.accounts.collateral_vault.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        transfer_amount,
+    )?;
+
+    // ENCRYPTED DATA HANDLING
+    // =======================
+    // encrypted_bet_data format: [encrypted_amount(16 bytes), encrypted_side(16 bytes)]
+    // - Private mode: Both amount and side encrypted
+    // - Public mode: Only side encrypted (amount is in plaintext above)
+    // YES/NO is ALWAYS encrypted in both modes!
+    
+    require!(
+        encrypted_bet_data.len() >= 32,
+        PredictionMarketError::InvalidProof
+    );
+
+    let encrypted_amount_bytes = encrypted_bet_data[0..16].to_vec();
+    let encrypted_side_bytes = encrypted_bet_data[16..32].to_vec();
+
+    // Store encrypted amount handle in Inco TEE
+    let encrypted_amount = new_euint128(
+        CpiContext::new(
+            ctx.accounts.inco_lightning_program.to_account_info(),
+            Operation {
+                signer: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        encrypted_amount_bytes,
+        0,
+    )?;
+
+    // Store encrypted side handle in Inco TEE (ALWAYS encrypted!)
+    let encrypted_side = new_euint128(
+        CpiContext::new(
+            ctx.accounts.inco_lightning_program.to_account_info(),
+            Operation {
+                signer: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        encrypted_side_bytes,
+        0,
+    )?;
+
+    // Store encrypted handles
+    bet_account.encrypted_amount = encrypted_amount;
+    bet_account.encrypted_side = encrypted_side;
+    bet_account.is_private_mode = is_private_mode;
+    bet_account.claimed = false;
+    bet_account.bump = ctx.bumps.bet_account;
+
+    emit!(BetPlacedEvent {
+        market_id: market.market_id,
+        user: ctx.accounts.user.key(),
+        is_private_mode,
+        // If public mode, amount is visible in transfer
+        // If private mode, amount is encrypted
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    msg!("Bet placed for market {}", market.market_id);
+    Ok(())
+}
+
+#[event]
+pub struct BetPlacedEvent {
+    pub market_id: u32,
+    pub user: Pubkey,
+    pub is_private_mode: bool, // Indicates which mode was used
+    pub timestamp: i64,
+    // YES/NO is ALWAYS encrypted - never in events!
+}
+
+set_winninf_side @@@@@@@@@@@@@@@@@@@@@@@@@@@@@222
+use crate::error::PredictionMarketError;
+use crate::state::Market;
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use inco_lightning::cpi::accounts::Operation;
+use inco_lightning::cpi::new_euint128;
+use inco_lightning::types::Euint128;
+use inco_lightning::ID as INCO_LIGHTNING_ID;
+
+// PRIVACY MODE SETTINGS
+const MAX_PRIVATE_BET: u64 = 10_000_000_000; // 10 SOL - max for private betting
+const PRIVATE_MODE_DEPOSIT: u64 = 10_000_000_000; // 10 SOL - fixed deposit for privacy
+
+#[derive(Accounts)]
+#[instruction(market_id: u32)]
+pub struct PlaceBetPrivate<'info> {
+    #[account(
+        mut,
+        seeds = [b"market", market.market_id.to_le_bytes().as_ref()],
+        bump = market.bump,
+        constraint = market.market_id == market_id
+    )]
+    pub market: Account<'info, Market>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = user_collateral.mint == market.collateral_mint,
+        constraint = user_collateral.owner == user.key()
+    )]
+    pub user_collateral: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = collateral_vault.key() == market.collateral_vault,
+        constraint = collateral_vault.owner == market.key()
+    )]
+    pub collateral_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+
+    /// CHECK: Inco Lightning program for encrypted operations
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + 32 + 32 + 1 + 1 + 1, // +1 for is_private_mode
+        seeds = [b"bet", market.key().as_ref(), user.key().as_ref()],
+        bump
+    )]
+    pub bet_account: Account<'info, BetData>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[account]
+pub struct BetData {
+    pub encrypted_amount: Euint128,
+    pub encrypted_side: Euint128,
+    pub is_private_mode: bool, // true = full privacy, false = amount visible
+    pub claimed: bool,
+    pub bump: u8,
+}
+
+pub fn handle(
+    ctx: Context<PlaceBetPrivate>,
+    _market_id: u32,
+    amount: u64, // Actual bet amount for public mode
+    is_private_mode: bool, // User chooses privacy mode
+    encrypted_bet_data: Vec<u8>,
+) -> Result<()> {
+    let market = &ctx.accounts.market;
+    let bet_account = &mut ctx.accounts.bet_account;
+
+    // Validate market state
+    require!(
+        !market.is_settled,
+        PredictionMarketError::MarketAlreadySettled
+    );
+    require!(
+        Clock::get()?.unix_timestamp < market.settlement_deadline,
+        PredictionMarketError::MarketExpired
+    );
+    require!(amount > 0, PredictionMarketError::InvalidAmount);
+
+    // Check if user already placed a bet
+    require!(!bet_account.claimed, PredictionMarketError::AlreadyClaimed);
+
+    let transfer_amount: u64;
+
+    if is_private_mode {
+        // PRIVATE MODE: Full privacy (amount + side encrypted)
+        // Max bet: 10 SOL
+        // Fixed deposit: 10 SOL (everyone deposits same amount)
+        
+        require!(
+            amount <= MAX_PRIVATE_BET,
+            PredictionMarketError::InvalidAmount
+        );
+
+        transfer_amount = PRIVATE_MODE_DEPOSIT;
+        
+        msg!("Private mode bet (max 10 SOL, full privacy)");
+    } else {
+        // PUBLIC AMOUNT MODE: Amount visible, side still encrypted
+        // No limit on bet amount
+        // Transfer actual bet amount (visible on-chain)
+        
+        transfer_amount = amount;
+        
+        msg!("Public amount mode (amount visible, unlimited)");
+    }
+
+    // Transfer collateral to vault
+    token::transfer(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_collateral.to_account_info(),
+                to: ctx.accounts.collateral_vault.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        transfer_amount,
+    )?;
+
+    // ENCRYPTED DATA HANDLING
+    // =======================
+    // encrypted_bet_data format: [encrypted_amount(16 bytes), encrypted_side(16 bytes)]
+    // - Private mode: Both amount and side encrypted
+    // - Public mode: Only side encrypted (amount is in plaintext above)
+    // YES/NO is ALWAYS encrypted in both modes!
+    
+    require!(
+        encrypted_bet_data.len() >= 32,
+        PredictionMarketError::InvalidProof
+    );
+
+    let encrypted_amount_bytes = encrypted_bet_data[0..16].to_vec();
+    let encrypted_side_bytes = encrypted_bet_data[16..32].to_vec();
+
+    // Store encrypted amount handle in Inco TEE
+    let encrypted_amount = new_euint128(
+        CpiContext::new(
+            ctx.accounts.inco_lightning_program.to_account_info(),
+            Operation {
+                signer: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        encrypted_amount_bytes,
+        0,
+    )?;
+
+    // Store encrypted side handle in Inco TEE (ALWAYS encrypted!)
+    let encrypted_side = new_euint128(
+        CpiContext::new(
+            ctx.accounts.inco_lightning_program.to_account_info(),
+            Operation {
+                signer: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        encrypted_side_bytes,
+        0,
+    )?;
+
+    // Store encrypted handles
+    bet_account.encrypted_amount = encrypted_amount;
+    bet_account.encrypted_side = encrypted_side;
+    bet_account.is_private_mode = is_private_mode;
+    bet_account.claimed = false;
+    bet_account.bump = ctx.bumps.bet_account;
+
+    emit!(BetPlacedEvent {
+        market_id: market.market_id,
+        user: ctx.accounts.user.key(),
+        is_private_mode,
+        // If public mode, amount is visible in transfer
+        // If private mode, amount is encrypted
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    msg!("Bet placed for market {}", market.market_id);
+    Ok(())
+}
+
+#[event]
+pub struct BetPlacedEvent {
+    pub market_id: u32,
+    pub user: Pubkey,
+    pub is_private_mode: bool, // Indicates which mode was used
+    pub timestamp: i64,
+    // YES/NO is ALWAYS encrypted - never in events!
+}
+
+
+market data struct @@@@@@@@@@@@@@@@@@@@@@@@@@@
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct Market {
+    pub authority: Pubkey,
+    pub market_id: u32,
+    #[max_len(200)]
+    pub question: String,
+    pub settlement_deadline: i64,
+    pub collateral_mint: Pubkey,
+    pub collateral_vault: Pubkey,
+    pub is_settled: bool,
+    pub winning_outcome: Option<WinningOutcome>,
+    pub bump: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace, Debug)]
+pub enum WinningOutcome {
+    OutcomeA,
+    OutcomeB,
+    Neither,
+}

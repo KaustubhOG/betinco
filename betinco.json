@@ -1,0 +1,134 @@
+{
+  "version": "0.1.0",
+  "name": "betinco",
+  "instructions": [
+    {
+      "name": "claimPrivate",
+      "accounts": [
+        { "name": "user", "isMut": true, "isSigner": true },
+        { "name": "market", "isMut": true, "isSigner": false },
+        { "name": "userCollateral", "isMut": true, "isSigner": false },
+        { "name": "collateralVault", "isMut": true, "isSigner": false },
+        { "name": "betAccount", "isMut": true, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false },
+        { "name": "incoLightningProgram", "isMut": false, "isSigner": false },
+        { "name": "instructionsSysvar", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "marketId", "type": "u32" },
+        { "name": "incoProof", "type": "bytes" }
+      ]
+    },
+    {
+      "name": "initializeMarket",
+      "accounts": [
+        { "name": "market", "isMut": true, "isSigner": false },
+        { "name": "authority", "isMut": true, "isSigner": true },
+        { "name": "collateralMint", "isMut": false, "isSigner": false },
+        { "name": "collateralVault", "isMut": true, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false },
+        { "name": "rent", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "marketId", "type": "u32" },
+        { "name": "settlementDeadline", "type": "i64" }
+      ]
+    },
+    {
+      "name": "placeBetPrivate",
+      "accounts": [
+        { "name": "market", "isMut": true, "isSigner": false },
+        { "name": "user", "isMut": true, "isSigner": true },
+        { "name": "userCollateral", "isMut": true, "isSigner": false },
+        { "name": "collateralVault", "isMut": true, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false },
+        { "name": "incoLightningProgram", "isMut": false, "isSigner": false },
+        { "name": "betAccount", "isMut": true, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "marketId", "type": "u32" },
+        { "name": "amount", "type": "u64" },
+        { "name": "side", "type": { "defined": "WinningOutcome" } },
+        { "name": "encryptedBetData", "type": "bytes" }
+      ]
+    },
+    {
+      "name": "setWinningSide",
+      "accounts": [
+        { "name": "authority", "isMut": true, "isSigner": true },
+        { "name": "market", "isMut": true, "isSigner": false }
+      ],
+      "args": [
+        { "name": "marketId", "type": "u32" },
+        { "name": "winner", "type": { "defined": "WinningOutcome" } }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "BetData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "encryptedAmount", "type": { "defined": "Euint128" } },
+          { "name": "encryptedSide", "type": { "defined": "Euint128" } },
+          { "name": "claimed", "type": "bool" },
+          { "name": "bump", "type": "u8" }
+        ]
+      }
+    },
+    {
+      "name": "Market",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "authority", "type": "publicKey" },
+          { "name": "marketId", "type": "u32" },
+          { "name": "settlementDeadline", "type": "i64" },
+          { "name": "collateralMint", "type": "publicKey" },
+          { "name": "collateralVault", "type": "publicKey" },
+          { "name": "isSettled", "type": "bool" },
+          { "name": "winningOutcome", "type": { "option": { "defined": "WinningOutcome" } } },
+          { "name": "bump", "type": "u8" }
+        ]
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "Euint128",
+      "type": {
+        "kind": "struct",
+        "fields": [{ "name": "value", "type": "u128" }]
+      }
+    },
+    {
+      "name": "WinningOutcome",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          { "name": "OutcomeA" },
+          { "name": "OutcomeB" },
+          { "name": "Neither" }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    { "code": 6000, "name": "MarketAlreadySettled", "msg": "Market has already been settled" },
+    { "code": 6001, "name": "MarketNotSettled", "msg": "Market has not been settled yet" },
+    { "code": 6002, "name": "MarketExpired", "msg": "Market deadline has passed" },
+    { "code": 6003, "name": "InvalidSettlementDeadline", "msg": "Settlement deadline must be in the future" },
+    { "code": 6004, "name": "SettlementTooEarly", "msg": "Settlement can only occur after deadline" },
+    { "code": 6005, "name": "InvalidAmount", "msg": "Amount must be greater than zero" },
+    { "code": 6006, "name": "InvalidWinningOutcome", "msg": "Invalid winning outcome specified" },
+    { "code": 6007, "name": "WinningOutcomeNotSet", "msg": "Winning outcome has not been set" },
+    { "code": 6008, "name": "MathOverflow", "msg": "Math operation overflow" },
+    { "code": 6009, "name": "InsufficientVaultBalance", "msg": "Insufficient balance in vault" },
+    { "code": 6010, "name": "InvalidProof", "msg": "Invalid proof from Inco" },
+    { "code": 6011, "name": "AlreadyClaimed", "msg": "User has already claimed rewards" },
+    { "code": 6012, "name": "NotEligible", "msg": "User is not eligible for rewards" }
+  ]
+}
